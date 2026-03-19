@@ -1,4 +1,4 @@
 #Dsa pratice 
 
 ## Platform 
-  -codeforces
+ -codeforces
