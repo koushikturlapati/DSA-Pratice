@@ -1,0 +1,4 @@
+#Dsa pratice 
+
+## Platform 
+  -codeforces
