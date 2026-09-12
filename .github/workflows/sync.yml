@@ -1,0 +1,21 @@
+name: Sync Codeforces Submissions
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:     # Creates the button on the website
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Run Codeforces Scraper
+        uses: jmerle/codeforces-scraper@v1
+        with:
+          handle: venkous_7
