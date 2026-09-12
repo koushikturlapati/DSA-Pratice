@@ -3,7 +3,7 @@ name: Sync Codeforces Submissions
 on:
   schedule:
     - cron: '0 0 * * *'
-  workflow_dispatch:     # Creates the button on the website
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -16,6 +16,6 @@ jobs:
           fetch-depth: 0
 
       - name: Run Codeforces Scraper
-        uses: jmerle/codeforces-scraper@v1
+        uses: jmerle/codeforces-scraper@master  # <-- Changed v1 to master to fix the repository error
         with:
           handle: venkous_7
