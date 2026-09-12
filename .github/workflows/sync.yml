@@ -2,8 +2,8 @@ name: Sync Codeforces Submissions
 
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *' # Runs automatically every night at midnight
+  workflow_dispatch:     # Enables the manual "Run workflow" action button
 
 jobs:
   sync:
@@ -20,17 +20,15 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Execute True Code Content Scraper
+      - name: Backdate Activity Log Without Files
         env:
           CF_HANDLE: "venkous_7"
         run: |
-          pip install requests beautifulsoup4
+          pip install requests
           python -c "
           import requests
           import os
           import subprocess
-          import re
-          from bs4 import BeautifulSoup
           from datetime import datetime
 
           handle = os.environ['CF_HANDLE']
@@ -39,71 +37,59 @@ jobs:
           try:
               res = requests.get(url, timeout=15).json()
           except Exception as e:
-              print(f'API Connection Error: {e}')
+              print(f'API Connection Timeout: {e}')
               exit(1)
 
           if res.get('status') != 'OK':
-              print('API Connection Refused')
+              print('API Connection Refused by Codeforces')
               exit(1)
 
+          # Extract only valid accepted submissions
           submissions = [s for s in res['result'] if s.get('verdict') == 'OK']
-          print(f'Successfully pulled {len(submissions)} accepted problems. Extracting raw code content...')
+          print(f'Found {len(submissions)} accepted solutions. Injecting timeline metadata...')
 
+          if not submissions:
+              print('No solutions found to track.')
+              exit(0)
+
+          # Configure safe automated system commit authorities
           subprocess.run(['git', 'config', '--global', 'user.name', 'GitHub Actions'])
           subprocess.run(['git', 'config', '--global', 'user.email', 'actions@github.com'])
 
+          log_file = 'activity.log'
           any_new_commits = False
 
+          # Process chronologically in the past
           for sub in reversed(submissions):
-              prob = sub['problem']
-              contest_id = prob.get('contestId', '')
-              prob_index = prob.get('index', '')
-              prob_name = prob.get('name', '').replace(' ', '_')
               submission_id = sub['id']
-              
-              if not contest_id or not prob_index:
-                  continue
+              timestamp = sub['creationTimeSeconds']
+              formatted_date = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
 
-              folder_name = f'Codeforces/{contest_id}{prob_index}'
-              os.makedirs(folder_name, exist_ok=True)
+              # Unique verification tag signature instead of code files
+              log_entry = f'Codeforces Submission Verified: ID {submission_id} at {formatted_date}\n'
 
-              lang = sub['programmingLanguage'].lower()
-              ext = '.cpp' if 'c++' in lang else '.py' if 'python' in lang else '.java' if 'java' in lang else '.txt'
-              file_path = os.path.join(folder_name, f'{prob_name}{ext}')
+              # Check if this specific submission was already logged
+              if os.path.exists(log_file):
+                  with open(log_file, 'r', encoding='utf-8') as f:
+                      if str(submission_id) in f.read():
+                          continue
 
-              if os.path.exists(file_path):
-                  continue
+              # Append metadata directly to the single timeline tracker file
+              with open(log_file, 'a', encoding='utf-8') as f:
+                  f.write(log_entry)
 
-              # Web scrape the actual code page from Codeforces
-              code_text = ''
-              try:
-                  source_url = f'https://codeforces.com{contest_id}/submission/{submission_id}'
-                  page = requests.get(source_url, timeout=15)
-                  soup = BeautifulSoup(page.text, 'html.parser')
-                  program_source = soup.find('pre', id='program-source-text')
-                  if program_source:
-                      code_text = program_source.text
-              except Exception as e:
-                  print(f'Failed parsing solution text for {submission_id}: {e}')
-
-              # Fallback text if scraping was blocked or restricted by the platform
-              if not code_text.strip():
-                  code_text = f'// Codeforces Problem: {contest_id}{prob_index} - {prob_name}\n// Submission ID: {submission_id}\n// Code block could not be extracted.'
-
-              with open(file_path, 'w', encoding='utf-8') as f:
-                  f.write(code_text)
-
-              formatted_date = datetime.fromtimestamp(sub['creationTimeSeconds']).strftime('%Y-%m-%d %H:%M:%S')
+              # Overwrite Git author timeline metrics safely to forge the past calendar grids
               os.environ['GIT_AUTHOR_DATE'] = formatted_date
               os.environ['GIT_COMMITTER_DATE'] = formatted_date
 
-              subprocess.run(['git', 'add', file_path])
-              subprocess.run(['git', 'commit', '-m', f'Sync {contest_id}{prob_index}: {prob_name} (Source Added)'])
+              subprocess.run(['git', 'add', log_file])
+              subprocess.run(['git', 'commit', '-m', f'Sync Profile History Reference ID {submission_id} (Backdated)'])
               any_new_commits = True
 
+          # Push changes up to the default cloud branch
           if any_new_commits:
               subprocess.run(['git', 'push', 'origin', 'main'])
-              print('Historical solution codebases successfully synchronized backdated!')
+              print('Activity history pipeline updated successfully!')
           else:
-              print('Repository structure is completely up to date.')
+              print('Calendar records are already up to date.')
           "
