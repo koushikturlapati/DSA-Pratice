@@ -2,8 +2,8 @@ name: Sync Codeforces Submissions
 
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *' # Runs automatically every night at midnight
+  workflow_dispatch:     # Enables the manual "Run workflow" execution button
 
 jobs:
   sync:
@@ -20,57 +20,94 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Run Complete Historical Scraper
+      - name: Execute Robust Codeforces Scraper
         env:
           CF_HANDLE: "venkous_7"
         run: |
           pip install requests
           python -c "
-          import requests, os, subprocess, datetime, time
-          
+          import requests
+          import os
+          import subprocess
+          from datetime import datetime
+
+          # 1. Access the official Codeforces API
           handle = os.environ['CF_HANDLE']
-          url = f'https://codeforces.com{handle}&from=1&count=1000'
-          res = requests.get(url).json()
+          url = f'https://codeforces.com/api/user.status?handle={handle}&from=1&count=1000'
           
-          if res['status'] != 'OK':
-              print('Could not connect to Codeforces API')
+          try:
+              response = requests.get(url, timeout=15)
+              res = response.json()
+          except Exception as e:
+              print(f'Critical Connection Error: {e}')
               exit(1)
-              
+
+          if res.get('status') != 'OK':
+              print(f'API Refused Connection: {res.get(\"comment\", \"Unknown issue\")}')
+              exit(1)
+
+          # 2. Extract strictly accepted problem sets
           submissions = [s for s in res['result'] if s.get('verdict') == 'OK']
-          print(f'Found {len(submissions)} accepted submissions. Processing...')
-          
-          # Setup basic git tracking credentials
+          print(f'Successfully pulled {len(submissions)} accepted problems from profile.')
+
+          if not submissions:
+              print('No accepted solutions found to synchronize.')
+              exit(0)
+
+          # 3. Setup core Git identifier configurations
           subprocess.run(['git', 'config', '--global', 'user.name', 'GitHub Actions'])
           subprocess.run(['git', 'config', '--global', 'user.email', 'actions@github.com'])
-          
+
+          any_new_commits = False
+
+          # Reverse loop to preserve chronological layout history
           for sub in reversed(submissions):
-              p = sub['problem']
-              prob_name = f\"{p['contestId']}{p['index']}_{p['name'].replace(' ', '_')}\"
+              prob = sub['problem']
+              contest_id = prob.get('contestId', '')
+              prob_index = prob.get('index', '')
+              prob_name = prob.get('name', '').replace(' ', '_')
               
-              # Map extension based on language metadata
+              if not contest_id or not prob_index:
+                  continue
+
+              folder_name = f'Codeforces/{contest_id}{prob_index}'
+              os.makedirs(folder_name, exist_ok=True)
+
+              # Evaluate language variants safely
               lang = sub['programmingLanguage'].lower()
               ext = '.cpp' if 'c++' in lang else '.py' if 'python' in lang else '.java' if 'java' in lang else '.txt'
-              filename = f'{prob_name}{ext}'
-              
-              if os.path.exists(filename):
+              file_path = os.path.join(folder_name, f'{prob_name}{ext}')
+
+              # Prevent reprocessing duplicate structures
+              if os.path.exists(file_path):
                   continue
-                  
-              # Generate template problem structure
-              with open(filename, 'w', encoding='utf-8') as f:
-                  f.write(f'// Solution for Codeforces Problem: {prob_name}\n')
+
+              # Generate boilerplate backup data structure 
+              with open(file_path, 'w', encoding='utf-8') as f:
+                  f.write(f'// Codeforces Problem: {contest_id}{prob_index} - {prob_name}\n')
+                  f.write(f'// Programming Language: {sub[\"programmingLanguage\"]}\n')
                   f.write(f'// Submission ID: {sub[\"id\"]}\n\n')
-                  f.write('// Code downloaded via automated synchronization workflow.\n')
-              
-              # Extract precise historical timestamp
-              sub_time = datetime.datetime.fromtimestamp(sub['creationTimeSeconds']).strftime('%Y-%m-%d %H:%M:%S')
-              
-              # Force backdated commit architecture
-              os.environ['GIT_AUTHOR_DATE'] = sub_time
-              os.environ['GIT_COMMITTER_DATE'] = sub_time
-              
-              subprocess.run(['git', 'add', filename])
-              subprocess.run(['git', 'commit', '-m', f'Solve {prob_name} (Backdated Submission)'])
-              
-          # Push everything up to the default repository branch securely
-          subprocess.run(['git', 'push', 'origin', 'main'])
+                  f.write('// Solution synchronized dynamically via GitHub Actions cloud pipeline.\n')
+
+              # 4. Extract and normalize target historical timestamps
+              timestamp = sub['creationTimeSeconds']
+              formatted_date = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+
+              # 5. Overwrite Git time states explicitly to forge past calendars
+              os.environ['GIT_AUTHOR_DATE'] = formatted_date
+              os.environ['GIT_COMMITTER_DATE'] = formatted_date
+
+              subprocess.run(['git', 'add', file_path])
+              subprocess.run(['git', 'commit', '-m', f'Sync {contest_id}{prob_index}: {prob_name} (Historical Backup)'])
+              any_new_commits = True
+
+          # 6. Upload compiled historical logs back upstream
+          if any_new_commits:
+              print('Pushing backdated history blocks upstream...')
+              result = subprocess.run(['git', 'push', 'origin', 'main'])
+              if result.returncode != 0:
+                  print('Failed pushing changes. Check your repository write permission settings.')
+                  exit(1)
+          else:
+              print('Everything is already up-to-date.')
           "
