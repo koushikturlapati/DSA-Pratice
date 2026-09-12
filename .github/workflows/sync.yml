@@ -2,8 +2,8 @@ name: Sync Codeforces Submissions
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Runs automatically every night at midnight
-  workflow_dispatch:     # Enables the manual "Run workflow" execution button
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -20,52 +20,46 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Execute Robust Codeforces Scraper
+      - name: Execute True Code Content Scraper
         env:
           CF_HANDLE: "venkous_7"
         run: |
-          pip install requests
+          pip install requests beautifulsoup4
           python -c "
           import requests
           import os
           import subprocess
+          import re
+          from bs4 import BeautifulSoup
           from datetime import datetime
 
-          # 1. Access the official Codeforces API
           handle = os.environ['CF_HANDLE']
-          url = f'https://codeforces.com/api/user.status?handle={handle}&from=1&count=1000'
+          url = f'https://codeforces.com{handle}&from=1&count=1000'
           
           try:
-              response = requests.get(url, timeout=15)
-              res = response.json()
+              res = requests.get(url, timeout=15).json()
           except Exception as e:
-              print(f'Critical Connection Error: {e}')
+              print(f'API Connection Error: {e}')
               exit(1)
 
           if res.get('status') != 'OK':
-              print(f'API Refused Connection: {res.get(\"comment\", \"Unknown issue\")}')
+              print('API Connection Refused')
               exit(1)
 
-          # 2. Extract strictly accepted problem sets
           submissions = [s for s in res['result'] if s.get('verdict') == 'OK']
-          print(f'Successfully pulled {len(submissions)} accepted problems from profile.')
+          print(f'Successfully pulled {len(submissions)} accepted problems. Extracting raw code content...')
 
-          if not submissions:
-              print('No accepted solutions found to synchronize.')
-              exit(0)
-
-          # 3. Setup core Git identifier configurations
           subprocess.run(['git', 'config', '--global', 'user.name', 'GitHub Actions'])
           subprocess.run(['git', 'config', '--global', 'user.email', 'actions@github.com'])
 
           any_new_commits = False
 
-          # Reverse loop to preserve chronological layout history
           for sub in reversed(submissions):
               prob = sub['problem']
               contest_id = prob.get('contestId', '')
               prob_index = prob.get('index', '')
               prob_name = prob.get('name', '').replace(' ', '_')
+              submission_id = sub['id']
               
               if not contest_id or not prob_index:
                   continue
@@ -73,41 +67,43 @@ jobs:
               folder_name = f'Codeforces/{contest_id}{prob_index}'
               os.makedirs(folder_name, exist_ok=True)
 
-              # Evaluate language variants safely
               lang = sub['programmingLanguage'].lower()
               ext = '.cpp' if 'c++' in lang else '.py' if 'python' in lang else '.java' if 'java' in lang else '.txt'
               file_path = os.path.join(folder_name, f'{prob_name}{ext}')
 
-              # Prevent reprocessing duplicate structures
               if os.path.exists(file_path):
                   continue
 
-              # Generate boilerplate backup data structure 
+              # Web scrape the actual code page from Codeforces
+              code_text = ''
+              try:
+                  source_url = f'https://codeforces.com{contest_id}/submission/{submission_id}'
+                  page = requests.get(source_url, timeout=15)
+                  soup = BeautifulSoup(page.text, 'html.parser')
+                  program_source = soup.find('pre', id='program-source-text')
+                  if program_source:
+                      code_text = program_source.text
+              except Exception as e:
+                  print(f'Failed parsing solution text for {submission_id}: {e}')
+
+              # Fallback text if scraping was blocked or restricted by the platform
+              if not code_text.strip():
+                  code_text = f'// Codeforces Problem: {contest_id}{prob_index} - {prob_name}\n// Submission ID: {submission_id}\n// Code block could not be extracted.'
+
               with open(file_path, 'w', encoding='utf-8') as f:
-                  f.write(f'// Codeforces Problem: {contest_id}{prob_index} - {prob_name}\n')
-                  f.write(f'// Programming Language: {sub[\"programmingLanguage\"]}\n')
-                  f.write(f'// Submission ID: {sub[\"id\"]}\n\n')
-                  f.write('// Solution synchronized dynamically via GitHub Actions cloud pipeline.\n')
+                  f.write(code_text)
 
-              # 4. Extract and normalize target historical timestamps
-              timestamp = sub['creationTimeSeconds']
-              formatted_date = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
-
-              # 5. Overwrite Git time states explicitly to forge past calendars
+              formatted_date = datetime.fromtimestamp(sub['creationTimeSeconds']).strftime('%Y-%m-%d %H:%M:%S')
               os.environ['GIT_AUTHOR_DATE'] = formatted_date
               os.environ['GIT_COMMITTER_DATE'] = formatted_date
 
               subprocess.run(['git', 'add', file_path])
-              subprocess.run(['git', 'commit', '-m', f'Sync {contest_id}{prob_index}: {prob_name} (Historical Backup)'])
+              subprocess.run(['git', 'commit', '-m', f'Sync {contest_id}{prob_index}: {prob_name} (Source Added)'])
               any_new_commits = True
 
-          # 6. Upload compiled historical logs back upstream
           if any_new_commits:
-              print('Pushing backdated history blocks upstream...')
-              result = subprocess.run(['git', 'push', 'origin', 'main'])
-              if result.returncode != 0:
-                  print('Failed pushing changes. Check your repository write permission settings.')
-                  exit(1)
+              subprocess.run(['git', 'push', 'origin', 'main'])
+              print('Historical solution codebases successfully synchronized backdated!')
           else:
-              print('Everything is already up-to-date.')
+              print('Repository structure is completely up to date.')
           "
