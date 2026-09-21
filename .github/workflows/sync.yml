@@ -11,7 +11,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -25,55 +25,35 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Python dependencies
-        run: python -m pip install --upgrade requests beautifulsoup4
+      - name: Install dependencies
+        run: python -m pip install --upgrade requests
 
-      - name: Fetch accepted Codeforces source and update activity log
+      - name: Update Codeforces activity log
         env:
           CF_HANDLE: "venkous_7"
         run: |
           python - <<'PY'
           import os
-          import re
           import subprocess
           import sys
-          import time
           from datetime import datetime, timezone
           from pathlib import Path
 
           import requests
-          from bs4 import BeautifulSoup
 
           handle = os.environ.get("CF_HANDLE", "").strip()
           if not handle:
               raise SystemExit("CF_HANDLE is empty")
 
-          session = requests.Session()
-          session.headers.update({
-              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-              "Accept-Language": "en-US,en;q=0.9",
-          })
-
-          def get(url, **kwargs):
-              last_error = None
-              for attempt in range(3):
-                  try:
-                      response = session.get(url, **kwargs)
-                      response.raise_for_status()
-                      return response
-                  except Exception as error:
-                      last_error = error
-                      if attempt < 2:
-                          time.sleep(2 ** attempt)
-              raise last_error
-
-          api_response = get(
+          response = requests.get(
               "https://codeforces.com/api/user.status",
               params={"handle": handle, "from": 1, "count": 1000},
+              headers={"User-Agent": "github-actions-codeforces-sync"},
               timeout=30,
           )
-          payload = api_response.json()
+          response.raise_for_status()
+          payload = response.json()
+
           if payload.get("status") != "OK":
               raise SystemExit(
                   f"Codeforces API error for {handle}: "
@@ -83,117 +63,54 @@ jobs:
           accepted = [
               submission for submission in payload.get("result", [])
               if submission.get("verdict") == "OK"
-              and submission.get("problem", {}).get("contestId") is not None
-              and submission.get("problem", {}).get("index")
           ]
-          accepted.reverse()  # oldest first; newest accepted solution wins per problem
+          accepted.reverse()  # write older submissions first
           print(f"Found {len(accepted)} accepted submissions for {handle}.")
 
-          extension_by_language = {
-              "Python 2": "py", "Python 3": "py", "PyPy 2": "py", "PyPy 3": "py",
-              "GNU C++": "cpp", "GNU C++17": "cpp", "GNU C++20": "cpp",
-              "GNU C++23": "cpp", "MS C++": "cpp", "C++": "cpp",
-              "Java": "java", "Java 8": "java", "Java 11": "java", "Java 17": "java",
-              "Kotlin": "kt", "JavaScript": "js", "Node.js": "js",
-              "Go": "go", "Rust": "rs", "C": "c", "C#": "cs", "PHP": "php",
-              "Ruby": "rb", "Scala": "scala", "Haskell": "hs", "D": "d",
-          }
-
-          def safe_name(value):
-              value = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "problem")
-              return value.strip("._") or "problem"
-
-          def usable_source(text):
-              if not text or not text.strip():
-                  return False
-              lowered = text.lower()
-              return "you must be logged in" not in lowered and "access denied" not in lowered
-
-          def fetch_source(submission):
-              contest_id = submission["contestId"]
-              submission_id = submission["id"]
-
-              # This endpoint returns the raw source for public submissions and is
-              # more reliable than scraping the rendered submission page.
-              raw_url = "https://codeforces.com/data/submitSource"
-              raw_response = get(raw_url, params={"submissionId": submission_id}, timeout=30)
-              if usable_source(raw_response.text):
-                  return raw_response.text, raw_url
-
-              # Keep the HTML fallback for installations where the raw endpoint is unavailable.
-              page_url = f"https://codeforces.com/contest/{contest_id}/submission/{submission_id}"
-              page_response = get(page_url, timeout=30)
-              soup = BeautifulSoup(page_response.text, "html.parser")
-              source = soup.select_one("pre#program-source-text")
-              if source is not None and usable_source(source.get_text()):
-                  return source.get_text(), page_url
-
-              title = soup.title.get_text(" ", strip=True) if soup.title else "no title"
-              raise RuntimeError(
-                  f"Codeforces returned no public source ({title}); "
-                  "the submission may be private or Codeforces blocked the request"
-              )
-
           log_path = Path("activity.log")
-          existing_log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
-          source_errors = []
-          source_count = 0
+          existing = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+          added = 0
 
-          for submission in accepted:
-              submission_id = str(submission["id"])
-              timestamp = submission.get("creationTimeSeconds")
-              if timestamp is not None and f"ID {submission_id}" not in existing_log:
+          with log_path.open("a", encoding="utf-8") as log:
+              for submission in accepted:
+                  submission_id = str(submission.get("id", ""))
+                  timestamp = submission.get("creationTimeSeconds")
+                  if not submission_id or timestamp is None:
+                      continue
+                  if f"ID {submission_id}" in existing:
+                      continue
+
+                  problem = submission.get("problem", {})
+                  contest_id = problem.get("contestId", "?")
+                  index = problem.get("index", "?")
+                  name = problem.get("name", "Unknown problem")
+                  language = submission.get("programmingLanguage", "Unknown language")
                   created = datetime.fromtimestamp(timestamp, tz=timezone.utc)
                   entry = (
                       "Codeforces Submission Verified: "
-                      f"ID {submission_id} at {created.strftime('%Y-%m-%d %H:%M:%S +0000')}\n"
+                      f"ID {submission_id} | Problem {contest_id}{index} - {name} | "
+                      f"Language: {language} | "
+                      f"at {created.strftime('%Y-%m-%d %H:%M:%S +0000')}\n"
                   )
-                  with log_path.open("a", encoding="utf-8") as log:
-                      log.write(entry)
-                  existing_log += f"ID {submission_id}\n"
+                  log.write(entry)
+                  existing += f"ID {submission_id}\n"
+                  added += 1
 
-              problem = submission["problem"]
-              problem_id = f"{problem['contestId']}{problem['index']}"
-              problem_name = safe_name(problem.get("name", problem_id))
-              extension = extension_by_language.get(
-                  submission.get("programmingLanguage", ""), "txt"
-              )
-              target = Path("Codeforces") / problem_id / f"{problem_name}.{extension}"
-
-              try:
-                  source, source_url = fetch_source(submission)
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  target.write_text(source.rstrip() + "\n", encoding="utf-8")
-                  source_count += 1
-                  print(f"Saved {target} from submission {submission_id}: {source_url}")
-              except Exception as error:
-                  source_errors.append(f"{submission_id}: {error}")
-                  print(f"Could not fetch submission {submission_id}: {error}")
-              time.sleep(0.5)
+          if added == 0:
+              print("No new accepted submissions. Activity log is already up to date.")
+              sys.exit(0)
 
           subprocess.run(["git", "config", "user.name", "GitHub Actions"], check=True)
           subprocess.run([
               "git", "config", "user.email",
               "41898282+github-actions[bot]@users.noreply.github.com",
           ], check=True)
-          subprocess.run(["git", "add", "Codeforces", "activity.log"], check=True)
-          if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode != 0:
-              subprocess.run([
-                  "git", "commit", "-m",
-                  "Sync accepted Codeforces source and activity log",
-              ], check=True)
-              branch = os.environ.get("GITHUB_REF_NAME") or "main"
-              subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
-              print(f"Pushed {source_count} source file(s) and activity.log.")
-          else:
-              print("No repository changes to commit.")
-
-          if source_errors:
-              print(f"Source fetch failed for {len(source_errors)} submission(s).")
-              for error in source_errors[:20]:
-                  print(f"  - {error}")
-              raise SystemExit(
-                  "Some source files could not be fetched. The activity log and any "
-                  "successfully fetched files were committed; see this job output."
-              )
+          subprocess.run(["git", "add", "activity.log"], check=True)
+          subprocess.run([
+              "git", "commit", "-m",
+              f"Log {added} accepted Codeforces submission(s)",
+          ], check=True)
+          branch = os.environ.get("GITHUB_REF_NAME") or "main"
+          subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
+          print(f"Added {added} accepted submission record(s) to activity.log.")
           PY
