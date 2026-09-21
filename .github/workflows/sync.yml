@@ -51,7 +51,8 @@ jobs:
           session = requests.Session()
           session.headers.update({
               "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+                            "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9",
           })
 
           def get(url, **kwargs):
@@ -102,20 +103,36 @@ jobs:
               value = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "problem")
               return value.strip("._") or "problem"
 
+          def usable_source(text):
+              if not text or not text.strip():
+                  return False
+              lowered = text.lower()
+              return "you must be logged in" not in lowered and "access denied" not in lowered
+
           def fetch_source(submission):
               contest_id = submission["contestId"]
               submission_id = submission["id"]
-              url = f"https://codeforces.com/contest/{contest_id}/submission/{submission_id}"
-              response = get(url, timeout=30)
-              soup = BeautifulSoup(response.text, "html.parser")
+
+              # This endpoint returns the raw source for public submissions and is
+              # more reliable than scraping the rendered submission page.
+              raw_url = "https://codeforces.com/data/submitSource"
+              raw_response = get(raw_url, params={"submissionId": submission_id}, timeout=30)
+              if usable_source(raw_response.text):
+                  return raw_response.text, raw_url
+
+              # Keep the HTML fallback for installations where the raw endpoint is unavailable.
+              page_url = f"https://codeforces.com/contest/{contest_id}/submission/{submission_id}"
+              page_response = get(page_url, timeout=30)
+              soup = BeautifulSoup(page_response.text, "html.parser")
               source = soup.select_one("pre#program-source-text")
-              if source is None:
-                  title = soup.title.get_text(" ", strip=True) if soup.title else "no title"
-                  raise RuntimeError(
-                      f"source is unavailable on the submission page ({title}); "
-                      "Codeforces may require authentication or may have blocked the request"
-                  )
-              return source.get_text(), url
+              if source is not None and usable_source(source.get_text()):
+                  return source.get_text(), page_url
+
+              title = soup.title.get_text(" ", strip=True) if soup.title else "no title"
+              raise RuntimeError(
+                  f"Codeforces returned no public source ({title}); "
+                  "the submission may be private or Codeforces blocked the request"
+              )
 
           log_path = Path("activity.log")
           existing_log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
@@ -127,11 +144,12 @@ jobs:
               timestamp = submission.get("creationTimeSeconds")
               if timestamp is not None and f"ID {submission_id}" not in existing_log:
                   created = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                  entry = (
+                      "Codeforces Submission Verified: "
+                      f"ID {submission_id} at {created.strftime('%Y-%m-%d %H:%M:%S +0000')}\n"
+                  )
                   with log_path.open("a", encoding="utf-8") as log:
-                      log.write(
-                          "Codeforces Submission Verified: "
-                          f"ID {submission_id} at {created.strftime('%Y-%m-%d %H:%M:%S +0000')}\n"
-                      )
+                      log.write(entry)
                   existing_log += f"ID {submission_id}\n"
 
               problem = submission["problem"]
@@ -144,8 +162,6 @@ jobs:
 
               try:
                   source, source_url = fetch_source(submission)
-                  if not source.strip():
-                      raise RuntimeError("source was empty")
                   target.parent.mkdir(parents=True, exist_ok=True)
                   target.write_text(source.rstrip() + "\n", encoding="utf-8")
                   source_count += 1
@@ -155,34 +171,29 @@ jobs:
                   print(f"Could not fetch submission {submission_id}: {error}")
               time.sleep(0.5)
 
-          if source_errors:
-              print(f"Source fetch failed for {len(source_errors)} submission(s).")
-              for error in source_errors[:20]:
-                  print(f"  - {error}")
-              if len(source_errors) > 20:
-                  print(f"  ... and {len(source_errors) - 20} more")
-              raise SystemExit(
-                  "The workflow is failing intentionally so a blocked/missing source "
-                  "cannot be reported as a successful sync."
-              )
-
-          if source_count == 0:
-              print("No accepted submissions were returned; nothing to commit.")
-              raise SystemExit(0)
-
           subprocess.run(["git", "config", "user.name", "GitHub Actions"], check=True)
           subprocess.run([
               "git", "config", "user.email",
               "41898282+github-actions[bot]@users.noreply.github.com",
           ], check=True)
           subprocess.run(["git", "add", "Codeforces", "activity.log"], check=True)
-          if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
+          if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode != 0:
+              subprocess.run([
+                  "git", "commit", "-m",
+                  "Sync accepted Codeforces source and activity log",
+              ], check=True)
+              branch = os.environ.get("GITHUB_REF_NAME") or "main"
+              subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
+              print(f"Pushed {source_count} source file(s) and activity.log.")
+          else:
               print("No repository changes to commit.")
-              raise SystemExit(0)
-          subprocess.run([
-              "git", "commit", "-m",
-              "Sync accepted Codeforces source and activity log",
-          ], check=True)
-          branch = os.environ.get("GITHUB_REF_NAME") or "main"
-          subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
+
+          if source_errors:
+              print(f"Source fetch failed for {len(source_errors)} submission(s).")
+              for error in source_errors[:20]:
+                  print(f"  - {error}")
+              raise SystemExit(
+                  "Some source files could not be fetched. The activity log and any "
+                  "successfully fetched files were committed; see this job output."
+              )
           PY
