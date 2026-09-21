@@ -11,7 +11,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -26,33 +26,40 @@ jobs:
           python-version: "3.10"
 
       - name: Install Python dependencies
-        run: python -m pip install --upgrade requests
+        run: python -m pip install --upgrade requests beautifulsoup4
 
-      - name: Sync Codeforces accepted submissions
+      - name: Sync accepted Codeforces submissions and source code
         env:
           CF_HANDLE: "venkous_7"
         run: |
           python - <<'PY'
           import os
+          import re
           import subprocess
           import sys
+          import time
           from datetime import datetime, timezone
+          from pathlib import Path
 
           import requests
+          from bs4 import BeautifulSoup
 
           handle = os.environ.get("CF_HANDLE", "").strip()
           if not handle:
               print("CF_HANDLE is empty; skipping sync.")
               sys.exit(0)
 
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (compatible; github-actions-codeforces-sync/1.0)"
+          })
+
           api_url = "https://codeforces.com/api/user.status"
           print(f"Fetching Codeforces submissions for handle: {handle}")
-
           try:
-              response = requests.get(
+              response = session.get(
                   api_url,
                   params={"handle": handle, "from": 1, "count": 1000},
-                  headers={"User-Agent": "github-actions-codeforces-sync"},
                   timeout=30,
               )
               response.raise_for_status()
@@ -67,59 +74,78 @@ jobs:
               sys.exit(1)
 
           accepted = [
-              submission
-              for submission in payload.get("result", [])
+              submission for submission in payload.get("result", [])
               if submission.get("verdict") == "OK"
+              and submission.get("problem", {}).get("contestId") is not None
+              and submission.get("problem", {}).get("index")
           ]
-          print(f"Found {len(accepted)} accepted submissions.")
+          # user.status is newest-first. Processing oldest-first means the newest
+          # accepted submission becomes the final version of each problem file.
+          accepted.reverse()
+          print(f"Found {len(accepted)} accepted submissions with problem metadata.")
 
-          if not accepted:
-              print("No accepted submissions found; nothing to commit.")
+          extension_by_language = {
+              "Python 2": "py", "Python 3": "py", "PyPy 2": "py", "PyPy 3": "py",
+              "GNU C++": "cpp", "GNU C++17": "cpp", "GNU C++20": "cpp",
+              "GNU C++23": "cpp", "MS C++": "cpp", "C++": "cpp",
+              "Java": "java", "Java 8": "java", "Java 11": "java", "Java 17": "java",
+              "Kotlin": "kt", "JavaScript": "js", "Node.js": "js",
+              "Go": "go", "Rust": "rs", "C": "c", "C#": "cs", "PHP": "php",
+              "Ruby": "rb", "Scala": "scala", "Haskell": "hs", "D": "d",
+          }
+
+          def safe_name(value):
+              value = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "problem")
+              return value.strip("._") or "problem"
+
+          def source_for(submission):
+              contest_id = submission["contestId"]
+              submission_id = submission["id"]
+              url = f"https://codeforces.com/contest/{contest_id}/submission/{submission_id}"
+              page = session.get(url, timeout=30)
+              page.raise_for_status()
+              soup = BeautifulSoup(page.text, "html.parser")
+              source = soup.select_one("pre#program-source-text")
+              if source is None:
+                  raise RuntimeError("source element was not present (Codeforces may require login or blocked the request)")
+              return source.get_text(), url
+
+          changed_files = []
+          for submission in accepted:
+              problem = submission["problem"]
+              problem_id = f"{problem['contestId']}{problem['index']}"
+              problem_name = safe_name(problem.get("name", problem_id))
+              language = submission.get("programmingLanguage", "")
+              extension = extension_by_language.get(language, "txt")
+              target = Path("Codeforces") / problem_id / f"{problem_name}.{extension}"
+
+              try:
+                  source, source_url = source_for(submission)
+                  if not source.strip():
+                      raise RuntimeError("source was empty")
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_text(source.rstrip() + "\n", encoding="utf-8")
+                  changed_files.append(str(target))
+                  print(f"Saved {target} from submission {submission['id']} ({source_url})")
+              except Exception as error:
+                  print(f"Could not fetch submission {submission['id']}: {error}")
+              time.sleep(0.5)
+
+          if not changed_files:
+              print("No source files were fetched; nothing to commit.")
               sys.exit(0)
 
           subprocess.run(["git", "config", "user.name", "GitHub Actions"], check=True)
-          subprocess.run(
-              ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
-              check=True,
-          )
-
-          log_file = "activity.log"
-          existing = ""
-          if os.path.exists(log_file):
-              with open(log_file, "r", encoding="utf-8") as file:
-                  existing = file.read()
-
-          added = 0
-          for submission in reversed(accepted):
-              submission_id = str(submission.get("id", ""))
-              timestamp = submission.get("creationTimeSeconds")
-              if not submission_id or timestamp is None or f"ID {submission_id}" in existing:
-                  continue
-
-              created = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-              formatted = created.strftime("%Y-%m-%d %H:%M:%S +0000")
-              entry = f"Codeforces Submission Verified: ID {submission_id} at {formatted}\n"
-
-              with open(log_file, "a", encoding="utf-8") as file:
-                  file.write(entry)
-              existing += entry
-
-              commit_environment = os.environ.copy()
-              commit_environment["GIT_AUTHOR_DATE"] = formatted
-              commit_environment["GIT_COMMITTER_DATE"] = formatted
-              subprocess.run(["git", "add", log_file], check=True)
-              subprocess.run(
-                  ["git", "commit", "-m", f"Sync CF submission {submission_id}"],
-                  check=True,
-                  env=commit_environment,
-              )
-              added += 1
-
-          if added == 0:
-              print("No new submissions to push.")
-              sys.exit(0)
-
+          subprocess.run([
+              "git", "config", "user.email",
+              "41898282+github-actions[bot]@users.noreply.github.com",
+          ], check=True)
+          subprocess.run(["git", "add", "Codeforces"], check=True)
+          subprocess.run([
+              "git", "commit", "-m",
+              f"Sync accepted Codeforces source for {len(set(changed_files))} problem file(s)",
+          ], check=True)
           branch = os.environ.get("GITHUB_REF_NAME") or "main"
           subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
-          print(f"Pushed {added} new submission record(s) to {branch}.")
+          print(f"Pushed {len(set(changed_files))} source file(s) to {branch}.")
           PY
