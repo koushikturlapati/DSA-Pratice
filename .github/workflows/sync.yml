@@ -2,87 +2,128 @@ name: Sync Codeforces Submissions
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    # Run once a day at midnight UTC.
+    - cron: "0 0 * * *"
   workflow_dispatch:
+
+# The workflow commits activity.log back to this repository.
+permissions:
+  contents: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: Checkout Repository Workspace
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Python Environment
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
-      - name: Backdate Activity Log Without Files
+      - name: Sync accepted Codeforces submissions
         env:
           CF_HANDLE: "venkous_7"
+          CF_API_URL: "https://codeforces.com/api/user.status"
         run: |
-          pip install requests
-          python -c "
-          import requests
+          python - <<'PY'
           import os
           import subprocess
-          from datetime import datetime
+          import sys
+          from datetime import datetime, timezone
 
-          handle = os.environ['CF_HANDLE']
-          # FIXED: Added the missing forward slash right after codeforces.com
-          url = f'https://codeforces.com{handle}&from=1&count=1000'
-          
+          import requests
+
+          handle = os.environ["CF_HANDLE"]
+          api_url = os.environ["CF_API_URL"]
+
           try:
-              res = requests.get(url, timeout=15).json()
-          except Exception as e:
-              print(f'API Connection Timeout: {e}')
-              exit(1)
+              response = requests.get(
+                  api_url,
+                  params={"handle": handle, "from": 1, "count": 1000},
+                  headers={"User-Agent": "github-actions-codeforces-sync"},
+                  timeout=30,
+              )
+              response.raise_for_status()
+              payload = response.json()
+          except (requests.RequestException, ValueError) as error:
+              print(f"Codeforces API request failed: {error}", file=sys.stderr)
+              sys.exit(1)
 
-          if res.get('status') != 'OK':
-              print('API Connection Refused by Codeforces')
-              exit(1)
+          if payload.get("status") != "OK":
+              print(f"Codeforces API returned an error: {payload}", file=sys.stderr)
+              sys.exit(1)
 
-          submissions = [s for s in res['result'] if s.get('verdict') == 'OK']
-          print(f'Found {len(submissions)} accepted solutions. Injecting timeline metadata...')
+          accepted = [
+              submission
+              for submission in payload.get("result", [])
+              if submission.get("verdict") == "OK"
+          ]
+          print(f"Found {len(accepted)} accepted submissions for {handle}.")
 
-          if not submissions:
-              print('No solutions found to track.')
-              exit(0)
+          if not accepted:
+              print("No accepted submissions found; nothing to commit.")
+              sys.exit(0)
 
-          subprocess.run(['git', 'config', '--global', 'user.name', 'GitHub Actions'])
-          subprocess.run(['git', 'config', '--global', 'user.email', 'actions@github.com'])
+          log_file = "activity.log"
+          existing = ""
+          if os.path.exists(log_file):
+              with open(log_file, encoding="utf-8") as log:
+                  existing = log.read()
 
-          log_file = 'activity.log'
-          any_new_commits = False
+          subprocess.run(["git", "config", "user.name", "GitHub Actions"], check=True)
+          subprocess.run(
+              ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
+              check=True,
+          )
 
-          for sub in reversed(submissions):
-              submission_id = sub['id']
-              timestamp = sub['creationTimeSeconds']
-              formatted_date = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+          added = 0
+          # Codeforces returns newest submissions first. Reversing makes the
+          # generated history chronological when several records are new.
+          for submission in reversed(accepted):
+              submission_id = str(submission["id"])
+              if f"ID {submission_id} " in existing:
+                  continue
 
-              log_entry = f'Codeforces Submission Verified: ID {submission_id} at {formatted_date}\n'
+              created = datetime.fromtimestamp(
+                  submission["creationTimeSeconds"], tz=timezone.utc
+              )
+              formatted_date = created.strftime("%Y-%m-%d %H:%M:%S +0000")
+              log_entry = (
+                  f"Codeforces Submission Verified: ID {submission_id} "
+                  f"at {formatted_date}\n"
+              )
 
-              if os.path.exists(log_file):
-                  with open(log_file, 'r', encoding='utf-8') as f:
-                      if str(submission_id) in f.read():
-                          continue
+              with open(log_file, "a", encoding="utf-8") as log:
+                  log.write(log_entry)
+              existing += log_entry
 
-              with open(log_file, 'a', encoding='utf-8') as f:
-                  f.write(log_entry)
+              env = os.environ.copy()
+              env["GIT_AUTHOR_DATE"] = formatted_date
+              env["GIT_COMMITTER_DATE"] = formatted_date
+              subprocess.run(["git", "add", log_file], check=True)
+              subprocess.run(
+                  [
+                      "git",
+                      "commit",
+                      "-m",
+                      f"Sync Codeforces submission {submission_id}",
+                  ],
+                  check=True,
+                  env=env,
+              )
+              added += 1
 
-              os.environ['GIT_AUTHOR_DATE'] = formatted_date
-              os.environ['GIT_COMMITTER_DATE'] = formatted_date
-
-              subprocess.run(['git', 'add', log_file])
-              subprocess.run(['git', 'commit', '-m', f'Sync Profile History Reference ID {submission_id} (Backdated)'])
-              any_new_commits = True
-
-          if any_new_commits:
-              subprocess.run(['git', 'push', 'origin', 'main'])
-              print('Activity history pipeline updated successfully!')
+          if added:
+              branch = os.environ.get("GITHUB_REF_NAME", "main")
+              subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
+              print(f"Added and pushed {added} new submission record(s).")
           else:
-              print('Calendar records are already up to date.')
-          "
+              print("Activity log is already up to date.")
+          PY
