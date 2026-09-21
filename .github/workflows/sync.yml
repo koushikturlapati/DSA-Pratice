@@ -25,6 +25,9 @@ jobs:
         with:
           python-version: "3.10"
 
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade requests
+
       - name: Sync Codeforces accepted submissions
         env:
           CF_HANDLE: "venkous_7"
@@ -54,17 +57,20 @@ jobs:
               )
               response.raise_for_status()
               payload = response.json()
-          except Exception as e:
-              print(f"Codeforces API request failed: {e}")
-              sys.exit(0)
+          except Exception as error:
+              print(f"Codeforces API request failed: {error}")
+              sys.exit(1)
 
           if payload.get("status") != "OK":
               message = payload.get("comment") or payload.get("error") or str(payload)
-              print(f"Codeforces API returned non-OK status for handle '{handle}': {message}")
-              sys.exit(0)
+              print(f"Codeforces API returned an error for handle '{handle}': {message}")
+              sys.exit(1)
 
-          results = payload.get("result") or []
-          accepted = [r for r in results if r.get("verdict") == "OK"]
+          accepted = [
+              submission
+              for submission in payload.get("result", [])
+              if submission.get("verdict") == "OK"
+          ]
           print(f"Found {len(accepted)} accepted submissions.")
 
           if not accepted:
@@ -80,48 +86,33 @@ jobs:
           log_file = "activity.log"
           existing = ""
           if os.path.exists(log_file):
-              with open(log_file, "r", encoding="utf-8") as f:
-                  existing = f.read()
+              with open(log_file, "r", encoding="utf-8") as file:
+                  existing = file.read()
 
           added = 0
           for submission in reversed(accepted):
-              submission_id = str(submission.get("id"))
-              if not submission_id:
-                  continue
-              if f"ID {submission_id}" in existing:
-                  continue
-
-              ts = submission.get("creationTimeSeconds")
-              if ts is None:
+              submission_id = str(submission.get("id", ""))
+              timestamp = submission.get("creationTimeSeconds")
+              if not submission_id or timestamp is None or f"ID {submission_id}" in existing:
                   continue
 
-              created = datetime.fromtimestamp(ts, tz=timezone.utc)
+              created = datetime.fromtimestamp(timestamp, tz=timezone.utc)
               formatted = created.strftime("%Y-%m-%d %H:%M:%S +0000")
-              log_entry = f"Codeforces Submission Verified: ID {submission_id} at {formatted}\n"
+              entry = f"Codeforces Submission Verified: ID {submission_id} at {formatted}\n"
 
-              with open(log_file, "a", encoding="utf-8") as f:
-                  f.write(log_entry)
-              existing += log_entry
+              with open(log_file, "a", encoding="utf-8") as file:
+                  file.write(entry)
+              existing += entry
 
-              env = os.environ.copy()
-              env["GIT_AUTHOR_DATE"] = formatted
-              env["GIT_COMMITTER_DATE"] = formatted
-
+              commit_environment = os.environ.copy()
+              commit_environment["GIT_AUTHOR_DATE"] = formatted
+              commit_environment["GIT_COMMITTER_DATE"] = formatted
               subprocess.run(["git", "add", log_file], check=True)
-              try:
-                  subprocess.run(
-                      ["git", "commit", "-m", f"Sync CF submission {submission_id}"],
-                      check=True,
-                      env=env,
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.PIPE,
-                      text=True,
-                  )
-              except subprocess.CalledProcessError as e:
-                  # If nothing actually changed, skip quietly.
-                  print(f"Commit skipped for {submission_id}: {e.stderr.strip()}")
-                  continue
-
+              subprocess.run(
+                  ["git", "commit", "-m", f"Sync CF submission {submission_id}"],
+                  check=True,
+                  env=commit_environment,
+              )
               added += 1
 
           if added == 0:
